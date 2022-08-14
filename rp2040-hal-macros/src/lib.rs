@@ -1,19 +1,30 @@
 extern crate proc_macro;
 
+use std::collections::HashSet;
+
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
-use syn::{parse, parse_macro_input, Item, ItemFn, Stmt};
+use syn::{parse::{self, Parse, ParseStream, Result}, parse_macro_input, Item, ItemFn, Stmt, Ident, Token, punctuated::Punctuated};
+
+struct Args{
+    vars: HashSet<Ident>
+}
+
+impl Parse for Args{
+    fn parse(input: ParseStream) -> Result<Self> {
+        // parses comma seperated Idents
+        let vars = Punctuated::<Ident, Token![,]>::parse_terminated(input)?;
+        Ok(Args {
+            vars: vars.into_iter().collect(),
+        })
+    }
+}
 
 #[proc_macro_attribute]
 pub fn entry(args: TokenStream, input: TokenStream) -> TokenStream {
     let mut f = parse_macro_input!(input as ItemFn);
-
-    if !args.is_empty() {
-        return parse::Error::new(Span::call_site(), "This attribute accepts no arguments")
-            .to_compile_error()
-            .into();
-    }
+    let mut args = parse_macro_input!(args as Args);
 
     let clear_locks: TokenStream = quote!(unsafe {
         const SIO_BASE: u32 = 0xd0000000;
@@ -27,7 +38,25 @@ pub fn entry(args: TokenStream, input: TokenStream) -> TokenStream {
     let clear_locks = parse_macro_input!(clear_locks as Stmt);
 
     // statics must stay first so cortex_m_rt::entry still finds them
-    let stmts = insert_after_static(f.block.stmts, clear_locks);
+    let mut stmts = insert_after_static(f.block.stmts, clear_locks);
+
+    if !args.vars.is_empty() {
+        let flash_id_ident = Ident::new("flash_id", Span::call_site());
+        if args.vars.take(&flash_id_ident).is_some() {
+            let get_id: TokenStream = quote!(
+                let flash_id: u64 = 0x6969696969696969;
+            ).into();
+            let get_id = parse_macro_input!(get_id as Stmt);
+            stmts = insert_after_static(stmts, get_id);
+        }
+
+        if !args.vars.is_empty() {
+            return parse::Error::new(Span::call_site(), "Invalid arguments")
+                .to_compile_error()
+                .into();
+        }
+    }
+    
     f.block.stmts = stmts;
 
     quote!(
