@@ -5,13 +5,18 @@ use std::collections::HashSet;
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
-use syn::{parse::{self, Parse, ParseStream, Result}, parse_macro_input, Item, ItemFn, Stmt, Ident, Token, punctuated::Punctuated};
+use syn::{
+    parse::{self, Parse, ParseStream, Result},
+    parse_macro_input,
+    punctuated::Punctuated,
+    Ident, Item, ItemFn, Stmt, Token,
+};
 
-struct Args{
-    vars: HashSet<Ident>
+struct Args {
+    vars: HashSet<Ident>,
 }
 
-impl Parse for Args{
+impl Parse for Args {
     fn parse(input: ParseStream) -> Result<Self> {
         // parses comma seperated Idents
         let vars = Punctuated::<Ident, Token![,]>::parse_terminated(input)?;
@@ -44,7 +49,73 @@ pub fn entry(args: TokenStream, input: TokenStream) -> TokenStream {
         let flash_id_ident = Ident::new("flash_id", Span::call_site());
         if args.vars.take(&flash_id_ident).is_some() {
             let get_id: TokenStream = quote!(
+                let flash_id: u64;
+                unsafe {
+                // Lookup function from bootrom
+                let rom_table_lookup: unsafe extern "C" fn(*const u16, u32) = core::mem::transmute(*const u16 = 0x0000_0018 as _;);
+                // Pointer to helper functions lookup table.
+                const FUNC_TABLE: *const u16 = 0x0000_0014 as _;
+
+                fn rom_func_lookup(code: u16) -> *const u32 {
+                    rom_table_lookup(
+                        FUNC_TABLE,
+                        code as u32,
+                    )
+                }
+
+                //boot2 is copied to ram so that we can use it once XIP is off
+                let mut boot2 = [0u32; 256/4];
+                core::ptr::copy_nonoverlapping(boot2.as_mut_ptr(), 0x10000000 as *const _, 64);
+
+                let boot2_fn_ptr = (boot2 as *const u32 as *const u8).offset(1);
+                let boot2_fn: unsafe extern "C" fn() -> () = core::mem::transmute(boot2_fn_ptr);
+
+                #[repr(C)]
+                struct FlashFunctionPointers<'a> {
+                    connect_internal_flash: unsafe extern "C" fn() -> (),
+                    flash_exit_xip: unsafe extern "C" fn() -> (),
+                    flash_flush_cache: unsafe extern "C" fn() -> (),
+                    flash_enter_xip: unsafe extern "C" fn() -> (),
+                    phantom: core::marker::PhantomData<&'a ()>,
+                }
+
+                let ptrs = FlashFunctionPointers {
+                    connect_internal_flash: core::mem::transmute(rom_func_lookup(u16::from_be_bytes([b'I', b'F']))),
+                    flash_exit_xip: core::mem::transmute(rom_func_lookup(u16::from_be_bytes([b'E', b'X']))),
+                    flash_flush_cache: core::mem::transmute(rom_func_lookup(u16::from_be_bytes([b'F', b'C']))),
+                    flash_enter_xip: boot2_fn,
+                    phantom: core::marker::PhantomData,
+                };
+
+                /*
+                Should be equivalent to:
+                rom_data::connect_internal_flash();
+                rom_data::flash_exit_xip();
+                send 4Bh command to get uid
+                rom_data::flash_flush_cache();
+                boot2();
+                */
+                /*core::arch::asm!(
+                    "ldr r4, [{ptrs}, #0]",
+                    "blx r4", // connect_internal_flash()
+
+                    "ldr r4, [{ptrs}, #4]",
+                    "blx r4", // flash_exit_xip()
+
+
+                    "ldr r4, [{ptrs}, #12]",
+                    "blx r4", // flash_flush_cache();
+
+                    "ldr r4, [{ptrs}, #16]",
+                    "blx r4", // boot2();
+                    ptrs = in(reg) ptrs,
+                    out("r0") flash_id,
+                    out("r4") _,
+                    clobber_abi("C"),
+                );*/
+
                 let flash_id: u64 = 0x6969696969696969;
+                }
             ).into();
             let get_id = parse_macro_input!(get_id as Stmt);
             stmts = insert_after_static(stmts, get_id);
@@ -56,7 +127,7 @@ pub fn entry(args: TokenStream, input: TokenStream) -> TokenStream {
                 .into();
         }
     }
-    
+
     f.block.stmts = stmts;
 
     quote!(
