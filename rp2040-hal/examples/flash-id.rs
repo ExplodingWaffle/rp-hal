@@ -25,7 +25,7 @@ use rp2040_hal as hal;
 use hal::pac;
 
 // Some traits we need
-use embedded_hal::digital::v2::OutputPin;
+use embedded_hal::digital::v2::{OutputPin, PinState};
 use embedded_time::fixed_point::FixedPoint;
 use rp2040_hal::clocks::Clock;
 
@@ -51,19 +51,26 @@ const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 fn main() -> ! {
     let flash_id: u64;
     unsafe {
-        unsafe fn rom_func_lookup(code: u16) -> *const u32 {
-            const FUNC_TABLE: *const u16 = 0x0000_0014 as _;
-            let rom_table_lookup: unsafe extern "C" fn(*const u16, u32) -> *const u32 =
-                core::mem::transmute(0x0000_0018 as *const u16);
-            let code = code;
-            rom_table_lookup(FUNC_TABLE, code as u32)
+        
+        unsafe fn rom_hword_as_ptr(rom_address: *const u16) -> *const u32 {
+            let ptr: u16 = *rom_address;
+            ptr as *const u32
         }
+        const ROM_TABLE_LOOKUP_PTR: *const u16 = 0x0000_0018 as _;
 
+        unsafe fn rom_func_lookup(code: u16) -> *const u32 {
+            const FUNC_TABLE: *const u16 = 0x0000_0014 as *const u16;
+            let rom_table_lookup: unsafe extern "C" fn(*const u16, u32) -> *const u32 =
+                core::mem::transmute(rom_hword_as_ptr(ROM_TABLE_LOOKUP_PTR));
+            let code = code as u32;
+            rom_table_lookup(rom_hword_as_ptr(FUNC_TABLE) as *const u16, code)
+        }
+        
         //boot2 is copied to ram so that we can use it once XIP is off
         let mut boot2 = [0u32; 256 / 4];
         //core::ptr::copy_nonoverlapping(0x10000000 as *const _, boot2.as_mut_ptr(), 64);
         let memcpy44: unsafe extern "C" fn(*mut u32, *const u32, u32) -> *mut u8 =
-            core::mem::transmute(rom_func_lookup(u16::from_be_bytes([b'C', b'4'])));
+            core::mem::transmute(rom_func_lookup(u16::from_le_bytes([b'C', b'4'])));
         memcpy44(&mut boot2 as *mut _, 0x10000000 as *const _, 256);
 
         let boot2_fn_ptr = (&boot2 as *const _ as *const u8).offset(1);
@@ -80,17 +87,17 @@ fn main() -> ! {
 
         let ptrs = FunctionPointers {
             //be or le?
-            connect_internal_flash: core::mem::transmute(rom_func_lookup(u16::from_be_bytes([
+            connect_internal_flash: core::mem::transmute(rom_func_lookup(u16::from_le_bytes([
                 b'I', b'F',
             ]))),
-            flash_exit_xip: core::mem::transmute(rom_func_lookup(u16::from_be_bytes([b'E', b'X']))),
-            flash_flush_cache: core::mem::transmute(rom_func_lookup(u16::from_be_bytes([
+            flash_exit_xip: core::mem::transmute(rom_func_lookup(u16::from_le_bytes([b'E', b'X']))),
+            flash_flush_cache: core::mem::transmute(rom_func_lookup(u16::from_le_bytes([
                 b'F', b'C',
             ]))),
             flash_enter_xip: boot2_fn,
             phantom: core::marker::PhantomData,
         };
-
+        
         #[inline(never)]
         #[link_section = ".data.ram_func"]
         unsafe fn get_id(ptrs: FunctionPointers) -> u64 {
@@ -113,22 +120,25 @@ fn main() -> ! {
             let sr = *SSI_SR;
             const CMD_UID: u8 = 0x4B;
             //do ssi stuff
-            let tx_byte = 0;
-            let rx_byte = 0;
+            let mut tx_byte = 0;
+            let mut rx_byte = 0;
             let mut tx_buf = [0u8; 8];
             tx_buf[0] = CMD_UID;
             let mut rx_buf = [0u8; 8];
-            //
-            while (tx_byte < 8) || (rx_byte < 8) {
+
+            while (tx_byte < 8) && (rx_byte < 8) {
                 let can_put = (sr & (1 << 1)) != 0; //bit 1 TFNF
                 let can_get = (sr & (1 << 3)) != 0; //bit 3 RFNE
-                if (tx_byte < 8) || can_put {
+                if (tx_byte < 8) && can_put {
                     dr = tx_buf[tx_byte] as u32;
+                    tx_byte += 1
                 }
-                if (rx_byte < 8) || can_get {
+                if (rx_byte < 8) && can_get {
                     rx_buf[rx_byte] = dr as u8;
+                    rx_byte += 1
                 }
             }
+
             // OUTOVER 9:8 = 0x3 to force CS high
             //cs_ctrl = (((1 << 2) - 1) << 8) & (0x3 << 8) | !(((1 << 2) - 1) << 8) & cs_ctrl;
             IO_QSPI_GPIO_QSPI_SS_CTRL.write_volatile((((1 << 2) - 1) << 8) & (0x3 << 8) | !(((1 << 2) - 1) << 8) & IO_QSPI_GPIO_QSPI_SS_CTRL.read_volatile());
@@ -139,6 +149,7 @@ fn main() -> ! {
 
         flash_id = get_id(ptrs);
     }
+
     // Grab our singleton objects
     let mut pac = pac::Peripherals::take().unwrap();
     let core = pac::CorePeripherals::take().unwrap();
@@ -176,10 +187,13 @@ fn main() -> ! {
 
     let mut led_pin = pins.gpio25.into_push_pull_output();
     loop {
-        led_pin.set_high().unwrap();
-        delay.delay_ms(500);
-        led_pin.set_low().unwrap();
-        delay.delay_ms(500);
+        for bit in 0u32..64 {
+            let is_set = flash_id & (1 << bit) != 0;
+            led_pin.set_state(PinState::from(is_set)).unwrap();
+            delay.delay_ms(500);
+            led_pin.set_state(!PinState::from(is_set)).unwrap();
+            delay.delay_ms(100);
+        }
     }
 }
 
